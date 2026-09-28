@@ -46,8 +46,9 @@ _EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_EXPERT_KEY_RE,
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
-    layer_to_bank=lambda layer, config: layer,  # every layer is MoE
+    layer_to_bank=lambda layer, config: layer,
     desc="Qwen3.8-Flash-Next NVFP4 experts",
+    tp_shard_intermediate=True,
 )
 # Per-tensor modelopt quant scales; consumed with their ``.weight`` (experts) or unused.
 _SCALE_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")

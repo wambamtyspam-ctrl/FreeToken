@@ -8,6 +8,7 @@ from typing import Callable
 
 import safetensors
 import torch
+from freetoken.distributed import get_tp_info
 from freetoken.utils import download_hf_weight
 from tqdm import tqdm
 
@@ -21,12 +22,67 @@ class Nvfp4ExpertSourceSpec:
     proj_to_role: dict[str, str]
     layer_to_bank: LayerToBank
     desc: str
-    # Maps checkpoint tensor-kind names onto the canonical (modelopt) kinds, e.g.
-    # compressed-tensors' weight_packed -> weight, weight_global_scale -> weight_scale_2.
     kind_map: dict[str, str] | None = None
-    # The checkpoint stores the QUANT-side global scale (local fp8 scales were
-    # multiplied by it before the cast); the banks keep its reciprocal.
     global_reciprocal: bool = False
+    tp_shard_intermediate: bool = False
+
+
+
+def _local_intermediate_range(
+    intermediate_size: int,
+    *,
+    rank: int,
+    world_size: int,
+) -> tuple[int, int]:
+    if world_size < 1:
+        raise ValueError(f"Invalid TP size: {world_size}")
+    if not 0 <= rank < world_size:
+        raise ValueError(f"Invalid TP rank {rank} for TP size {world_size}")
+    if intermediate_size % world_size:
+        raise ValueError(
+            f"NVFP4 intermediate size {intermediate_size} "
+            f"is not divisible by TP size {world_size}"
+        )
+
+    local_intermediate = intermediate_size // world_size
+    if local_intermediate % 16:
+        raise ValueError(
+            f"NVFP4 local intermediate {local_intermediate} "
+            "must be divisible by 16"
+        )
+
+    start = rank * local_intermediate
+    return start, start + local_intermediate
+
+
+
+def _shard_nvfp4_expert_tensor(
+    tensor: torch.Tensor,
+    *,
+    role: str,
+    kind: str,
+    start: int,
+    end: int,
+) -> torch.Tensor:
+    if kind == "weight_scale_2":
+        return tensor
+
+    if role in ("gate", "up"):
+        if kind in ("weight", "weight_scale"):
+            return tensor[start:end, :].clone()
+
+    if role == "down":
+        if kind == "weight":
+            if start % 2 or end % 2:
+                raise ValueError("NVFP4 weight shard must align to packed bytes")
+            return tensor[:, start // 2:end // 2].clone()
+
+        if kind == "weight_scale":
+            if start % 16 or end % 16:
+                raise ValueError("NVFP4 scale shard must align to 16-value groups")
+            return tensor[:, start // 16:end // 16].clone()
+
+    raise ValueError(f"Unsupported NVFP4 expert tensor: {role=}, {kind=}")
 
 
 def _canon_kind(spec: "Nvfp4ExpertSourceSpec", kind: str) -> str:
@@ -89,6 +145,16 @@ def iter_nvfp4_expert_pieces(
     folder = download_hf_weight(model_path)
     weight_map = safetensors_weight_map(folder)
 
+    tp_range = None
+
+    if spec.tp_shard_intermediate:
+        tp_info = get_tp_info()
+        tp_range = _local_intermediate_range(
+            config.moe_intermediate_size,
+            rank=tp_info.rank,
+            world_size=tp_info.size,
+        )
+
     wanted: dict[str, tuple[int, int, str]] = {}
     for name in weight_map:
         match = spec.key_pattern.match(name)
@@ -108,6 +174,34 @@ def iter_nvfp4_expert_pieces(
     if len(wanted) != expected:
         raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {expected}")
 
+
+    def _process_tensor(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        role_name = wanted[name][2]
+
+        if tp_range is not None:
+            if role_name.endswith("_global"):
+                role = role_name.removesuffix("_global")
+                kind = "weight_scale_2"
+            elif role_name.endswith("_scale"):
+                role = role_name.removesuffix("_scale")
+                kind = "weight_scale"
+            else:
+                role = role_name
+                kind = "weight"
+
+            tensor = _shard_nvfp4_expert_tensor(
+                tensor,
+                role=role,
+                kind=kind,
+                start=tp_range[0],
+                end=tp_range[1],
+            )
+
+        if role_name.endswith("_global"):
+            tensor = _ingest_global(spec, tensor)
+
+        return tensor
+
     def _serial():
         by_shard: dict[str, list[str]] = collections.defaultdict(list)
         for name, shard in weight_map.items():
@@ -119,18 +213,14 @@ def iter_nvfp4_expert_pieces(
             with safetensors.safe_open(path, framework="pt", device="cpu") as f:
                 for name in by_shard[shard]:
                     tensor = f.get_tensor(name)
-                    if wanted[name][2].endswith("_global"):
-                        tensor = _ingest_global(spec, tensor)
-                    yield name, tensor
+                    yield name, _process_tensor(name, tensor)
             drop(path)
 
     def _parallel():
         from freetoken.models.weight import iter_expert_tensors_parallel
 
         for name, tensor in iter_expert_tensors_parallel(folder, lambda n: n in wanted, workers=workers, chunk=chunk):
-            if wanted[name][2].endswith("_global"):
-                tensor = _ingest_global(spec, tensor)
-            yield name, tensor
+            yield name, _process_tensor(name, tensor)
 
     return per_expert_pieces(_parallel() if parallel else _serial(), wanted.get, tensors_per_expert=9)
 

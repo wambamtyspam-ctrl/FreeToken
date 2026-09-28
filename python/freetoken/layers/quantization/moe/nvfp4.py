@@ -496,7 +496,7 @@ class B12xNvfp4MoEKernel(MoEKernel):
             return f"b12x requires sm_120+, got sm_{cc[0]}{cc[1]}"
         if not backend.is_flashinfer_installed():
             return "flashinfer is not installed"
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=False, plain_silu_only=True)
+        reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=False, plain_silu_only=True)
         if reason:
             return reason
         return _b12x_unusable_reason(cc)
@@ -512,7 +512,7 @@ class B12xNvfp4MoEKernel(MoEKernel):
 
     def layout(self, cfg: MoEConfig) -> dict[str, BankSpec]:
         # flashinfer's prepared tiles: the Marlin shapes, byte-identical to the native rows
-        i, h = cfg.intermediate, cfg.hidden
+        i, h = cfg.local_intermediate, cfg.hidden
         return {
             "gate_up": BankSpec((h // GROUP, 4 * i), torch.int32),
             "gate_up_scale": BankSpec((h // GROUP, 2 * i), FP8),
@@ -525,7 +525,7 @@ class B12xNvfp4MoEKernel(MoEKernel):
     def pack(self, pieces, cfg: MoEConfig, out):
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import prepare_w4a16_packed_weights
 
-        i, h = cfg.intermediate, cfg.hidden
+        i, h = cfg.local_intermediate, cfg.hidden
         device = torch.device("cuda")
         gu = fused_piece(pieces, "gate_up").to(device)
         gug = fused_global(pieces, i).to(device).float()
